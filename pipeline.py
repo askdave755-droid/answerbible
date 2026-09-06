@@ -30,7 +30,8 @@ def get_r2_client():
 def _r2_public_base() -> str:
     # Set R2_PUBLIC_URL to the bucket's real pub-<hash>.r2.dev URL (or custom domain).
     # The pub-{account_id} fallback is NOT a valid R2 URL — kept only to avoid crashing.
-    return os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev")
+    # rstrip('/') guards against a trailing slash in R2_PUBLIC_URL producing //videos/...
+    return os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev").rstrip('/')
 
 def upload_video(prod_id: str, file_path: str) -> str:
     bucket = os.getenv('R2_BUCKET_NAME')
