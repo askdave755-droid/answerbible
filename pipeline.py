@@ -27,6 +27,11 @@ def get_r2_client():
         config=Config(signature_version='s3v4')
     )
 
+def _r2_public_base() -> str:
+    # Set R2_PUBLIC_URL to the bucket's real pub-<hash>.r2.dev URL (or custom domain).
+    # The pub-{account_id} fallback is NOT a valid R2 URL — kept only to avoid crashing.
+    return os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev")
+
 def upload_video(prod_id: str, file_path: str) -> str:
     bucket = os.getenv('R2_BUCKET_NAME')
     if not bucket:
@@ -34,12 +39,21 @@ def upload_video(prod_id: str, file_path: str) -> str:
     key = f"videos/{prod_id}.mp4"
     client = get_r2_client()
     client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
-    public_url = os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev")
-    return f"{public_url}/{key}"
+    return f"{_r2_public_base()}/{key}"
+
+def upload_captions(prod_id: str, file_path: str) -> str:
+    bucket = os.getenv('R2_BUCKET_NAME')
+    if not bucket:
+        raise ValueError("Missing R2_BUCKET_NAME")
+    key = f"captions/{prod_id}.srt"
+    client = get_r2_client()
+    client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': 'text/plain'})
+    return f"{_r2_public_base()}/{key}"
 
 from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus, Confidence, ClaimType, DoctrinalCategory, get_engine, SessionLocal
 from config import settings
 from theology_gate import run_theology_gate
+from video_providers import generate_scene_visual, provider_status
 
 router = APIRouter()
 
@@ -295,11 +309,14 @@ def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depen
         raise HTTPException(400, f"{failed} claims have not passed evidence gate")
 
     prod.stage = Stage.PRODUCTION
+    prod.status = "active"  # clear any previous simulated flag on retry
     db.commit()
     background_tasks.add_task(_produce_scenes, prod_id)
-    return {"id": prod.id, "stage": prod.stage.value, "message": "Production started in background."}
+    return {"id": prod.id, "stage": prod.stage.value,
+            "providers": provider_status(),
+            "message": "Production started in background."}
 
-# ============ FIXED PRODUCTION ENGINE ============
+# ============ PRODUCTION ENGINE (Lumen-style provider chain) ============
 
 def _produce_scenes(prod_id: str):
     engine = get_engine(settings.database_url)
@@ -325,12 +342,26 @@ def _produce_scenes(prod_id: str):
                     _silent_audio(audio_path, est)
                     print(f"[TTS] No voice generated for scene {scene.id}, using silent track")
                 scene.narration_audio_path = audio_path
-            # --- VISUAL (guaranteed to exist) ---
+            # --- VISUAL: Lumen-style provider chain with simulated flagging ---
             if not visual_ok:
-                visual_path = f"{settings.output_dir}/visuals/{scene.id}.png"
-                _generate_placeholder_visual(scene.visual_prompt or scene.narration_text or "Answers in Faith", visual_path)
-                scene.visual_path = visual_path
-            scene.generation_status = "done"
+                est_dur = max(3.0, min(float(settings.max_scene_duration),
+                                       len(scene.narration_text or "") * 0.06))
+                out_base = f"{settings.output_dir}/visuals/{scene.id}"
+                path, provider, simulated = generate_scene_visual(
+                    scene.visual_prompt or scene.narration_text or "Answers in Faith",
+                    out_base, est_dur)
+                if simulated:
+                    path = out_base + ".png"
+                    _generate_placeholder_visual(
+                        scene.visual_prompt or scene.narration_text or "Answers in Faith", path)
+                    scene.generation_status = "simulated"
+                    print(f"[Video] Scene {scene.id} using PLACEHOLDER visual (simulated)")
+                else:
+                    scene.generation_status = f"done:{provider}"
+                    print(f"[Video] Scene {scene.id} visual via {provider}: {path}")
+                scene.visual_path = path
+            if scene.generation_status != "simulated" and not scene.generation_status.startswith("done:"):
+                scene.generation_status = "done"
             db.commit()
         prod = db.query(Production).filter(Production.id == prod_id).first()
         prod.stage = Stage.ASSEMBLY
@@ -406,10 +437,34 @@ def _generate_placeholder_visual(prompt: str, output_path: str):
            "-frames:v", "1", output_path]
     result = subprocess.run(cmd, capture_output=True, timeout=30)
     if result.returncode != 0 or not os.path.exists(output_path):
-        # fallback: plain dark frame so a visual ALWAYS exists
         cmd = [settings.ffmpeg_path, "-y", "-f", "lavfi", "-i",
                "color=c=0x0f172a:s=1280x720:d=1", "-frames:v", "1", output_path]
         subprocess.run(cmd, capture_output=True, timeout=30)
+
+def _clip_from_image(image_path: str, audio_path: str, dur: float, clip: str):
+    """Ken Burns pan/zoom on a still image — output normalized for concat."""
+    frames = max(1, int(dur * 30))
+    vf = (f"scale=1600:900:force_original_aspect_ratio=increase,crop=1600:900,"
+          f"zoompan=z='1+0.15*on/{frames}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+          f"s=1280x720:fps=30,format=yuv420p")
+    cmd = [
+        settings.ffmpeg_path, "-y", "-loop", "1", "-framerate", "30", "-i", image_path,
+        "-i", audio_path, "-vf", vf,
+        "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-t", str(dur), "-shortest", clip
+    ]
+    return subprocess.run(cmd, capture_output=True, timeout=180)
+
+def _clip_from_video(video_path: str, audio_path: str, dur: float, clip: str):
+    """Loop/trim an AI-generated clip to narration length — normalized for concat."""
+    vf = "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,fps=30,format=yuv420p"
+    cmd = [
+        settings.ffmpeg_path, "-y", "-stream_loop", "-1", "-i", video_path,
+        "-i", audio_path, "-map", "0:v", "-map", "1:a", "-vf", vf,
+        "-c:v", "libx264", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-t", str(dur), clip
+    ]
+    return subprocess.run(cmd, capture_output=True, timeout=180)
 
 def _assemble_video(prod_id: str, db: Session):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -431,14 +486,11 @@ def _assemble_video(prod_id: str, db: Session):
             dur = 5.0
         dur = min(dur, float(settings.max_scene_duration))
         clip = f"{settings.output_dir}/final/{scene.id}_clip.mp4"
-        cmd = [
-            settings.ffmpeg_path, "-y", "-loop", "1", "-i", scene.visual_path,
-            "-i", scene.narration_audio_path, "-c:v", "libx264", "-tune", "stillimage",
-            "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p", "-t", str(dur),
-            "-shortest", clip
-        ]
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=180)
+            if scene.visual_path.lower().endswith(".mp4"):
+                result = _clip_from_video(scene.visual_path, scene.narration_audio_path, dur, clip)
+            else:
+                result = _clip_from_image(scene.visual_path, scene.narration_audio_path, dur, clip)
             if result.returncode == 0 and os.path.exists(clip):
                 scene_list.append(clip)
             else:
@@ -459,6 +511,12 @@ def _assemble_video(prod_id: str, db: Session):
            "-i", concat_file, "-c", "copy", final_output]
     result = subprocess.run(cmd, capture_output=True, timeout=120)
     if result.returncode != 0 or not os.path.exists(final_output):
+        # Re-encode fallback in case stream-copy rejects mismatched params
+        cmd = [settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
+               "-i", concat_file, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "128k", "-ar", "44100", final_output]
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode != 0 or not os.path.exists(final_output):
         _fail_production(db, prod_id, f"Concat failed: {result.stderr.decode()[:300]}")
         return
 
@@ -470,8 +528,72 @@ def _assemble_video(prod_id: str, db: Session):
     except Exception as e:
         print(f"[R2] Upload failed (local file kept): {e}")
 
+    # --- Captions (SRT), Lumen-style ---
+    try:
+        srt_path = _write_captions(prod_id, scenes)
+        if srt_path:
+            try:
+                prod.captions_url = upload_captions(prod_id, srt_path)
+                print(f"[R2] Captions uploaded: {prod.captions_url}")
+            except Exception as e:
+                print(f"[R2] Captions upload failed (local kept): {e}")
+    except Exception as e:
+        print(f"[Captions] Failed: {e}")
+
+    # --- Simulated honesty gate (ported from Lumen) ---
+    simulated = any(s.generation_status == "simulated" for s in scenes)
+    if simulated:
+        prod.status = "simulated"
+        db.add(ReviewDecision(
+            id=str(uuid.uuid4()), production_id=prod_id, stage="production",
+            decision=ReviewStatus.FAIL, reviewer="system",
+            notes="One or more scenes used PLACEHOLDER visuals. Quality gate will block PASS until scenes are regenerated with a real provider."))
+        print(f"[Assembly] {prod_id} marked SIMULATED — placeholder visuals present")
+    else:
+        prod.status = "ready"
+
     prod.stage = Stage.QUALITY_GATE
     db.commit()
+
+def _write_captions(prod_id: str, scenes) -> Optional[str]:
+    """Generate SRT captions from scene narration timed to audio durations."""
+    def ts(seconds: float) -> str:
+        h = int(seconds // 3600); m = int((seconds % 3600) // 60)
+        s = int(seconds % 60); ms = int((seconds % 1) * 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    blocks = []
+    idx = 1
+    cursor = 0.0
+    for scene in scenes:
+        text = (scene.narration_text or "").strip()
+        if not text:
+            continue
+        dur = 5.0
+        if scene.narration_audio_path and os.path.exists(scene.narration_audio_path):
+            d = _get_audio_duration(scene.narration_audio_path)
+            if d > 0:
+                dur = min(d, float(settings.max_scene_duration))
+        words = text.split()
+        per = 8
+        chunks = [words[i:i + per] for i in range(0, len(words), per)]
+        chunk_dur = dur / max(1, len(chunks))
+        t = cursor
+        for chunk in chunks:
+            blocks.append(f"{idx}\n{ts(t)} --> {ts(t + chunk_dur)}\n{' '.join(chunk)}\n")
+            idx += 1
+            t += chunk_dur
+        cursor += dur
+
+    if not blocks:
+        return None
+    out_dir = f"{settings.output_dir}/captions"
+    os.makedirs(out_dir, exist_ok=True)
+    srt_path = f"{out_dir}/{prod_id}.srt"
+    with open(srt_path, "w") as f:
+        f.write("\n".join(blocks))
+    print(f"[Captions] Wrote {srt_path} ({idx - 1} blocks)")
+    return srt_path
 
 def _get_audio_duration(path: str) -> float:
     import re
@@ -494,7 +616,7 @@ def _get_audio_duration(path: str) -> float:
         pass
     return 5.0
 
-# ============ END FIXED ENGINE ============
+# ============ END ENGINE ============
 
 @router.post("/productions/{prod_id}/quality")
 def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)):
@@ -503,6 +625,17 @@ def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
         raise HTTPException(404, "Production not found")
     if prod.stage != Stage.QUALITY_GATE:
         raise HTTPException(400, f"Expected QUALITY_GATE, got {prod.stage.value}")
+
+    # Lumen-style honesty: placeholder visuals can never pass quality
+    if data.decision.lower() == "pass" and prod.status == "simulated":
+        db.add(ReviewDecision(
+            id=str(uuid.uuid4()), production_id=prod_id, stage="quality_gate",
+            decision=ReviewStatus.FAIL, reviewer="system",
+            notes="BLOCKED: production contains placeholder (simulated) visuals. Regenerate with a real provider before approval."))
+        db.commit()
+        raise HTTPException(400, "BLOCKED: this video contains placeholder visuals (status=simulated). "
+                                 "Configure REPLICATE_API_TOKEN or OPENAI_API_KEY and re-run produce.")
+
     decision = ReviewDecision(
         id=str(uuid.uuid4()), production_id=prod_id, stage="quality_gate",
         decision=ReviewStatus(data.decision.lower()), reviewer=data.reviewer, notes=data.notes or ""
@@ -541,6 +674,8 @@ def final_approval(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_d
         raise HTTPException(400, f"Expected APPROVAL, got {prod.stage.value}")
     if data.decision.lower() != "pass":
         return {"id": prod.id, "message": "Approval denied."}
+    if prod.status == "simulated":
+        raise HTTPException(400, "BLOCKED: simulated (placeholder) productions cannot be published.")
     prod.stage = Stage.PUBLISHED
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for YouTube upload."}
@@ -552,15 +687,20 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Production not found")
     claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
     scenes = db.query(Scene).filter(Scene.production_id == prod_id).order_by(Scene.order_index).all()
-    
+
     video_path = f"./output/final/{prod_id}.mp4"
     has_video = bool(prod.video_url) or os.path.exists(video_path)
     video_url = prod.video_url
     if not video_url and os.path.exists(video_path):
         video_url = f"/api/download/{prod_id}"
-    
+    captions_url = getattr(prod, "captions_url", None)
+    if not captions_url and os.path.exists(f"./output/captions/{prod_id}.srt"):
+        captions_url = f"/api/download-captions/{prod_id}"
+
     return {
         "id": prod.id, "topic": prod.topic, "stage": prod.stage.value,
+        "status": prod.status,
+        "simulated": prod.status == "simulated",
         "doctrinal_category": prod.doctrinal_category.value,
         "primary_scripture": prod.primary_scripture,
         "gospel_video": prod.gospel_video,
@@ -570,6 +710,7 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "approved_by": prod.approved_by,
         "has_video": has_video,
         "video_url": video_url,
+        "captions_url": captions_url,
         "claims": [{"id": c.id, "text": c.claim_text, "status": c.evidence_status.value,
                     "confidence": c.confidence.value, "type": c.claim_type.value,
                     "source_reference": c.source_reference,
@@ -580,6 +721,7 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
                     "alternative_interpretations": c.alternative_interpretations,
                     "evidence_notes": c.evidence_notes} for c in claims],
         "scenes": [{"id": s.id, "order": s.order_index, "status": s.generation_status, "locked": s.is_locked,
+                    "simulated": s.generation_status == "simulated",
                     "narration_text": s.narration_text, "visual_prompt": s.visual_prompt} for s in scenes]
     }
 
@@ -590,6 +732,7 @@ def list_productions(stage: Optional[str] = None, db: Session = Depends(get_db))
         q = q.filter(Production.stage == stage)
     prods = q.order_by(Production.created_at.desc()).all()
     return [{"id": p.id, "topic": p.topic, "stage": p.stage.value,
+             "status": p.status,
              "doctrinal_category": p.doctrinal_category.value,
              "primary_scripture": p.primary_scripture,
              "created_at": p.created_at} for p in prods]
