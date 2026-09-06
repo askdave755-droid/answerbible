@@ -19,6 +19,11 @@ def get_r2_client():
         config=Config(signature_version='s3v4')
     )
 
+def _r2_public_base() -> str:
+    # Set R2_PUBLIC_URL to the bucket's real pub-<hash>.r2.dev URL (or custom domain).
+    # The pub-{account_id} fallback is NOT a valid R2 URL — kept only to avoid crashing.
+    return os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev")
+
 def upload_video(prod_id: str, file_path: str) -> str:
     bucket = os.getenv('R2_BUCKET_NAME')
     if not bucket:
@@ -28,5 +33,4 @@ def upload_video(prod_id: str, file_path: str) -> str:
     client = get_r2_client()
     client.upload_file(file_path, bucket, key, ExtraArgs={'ContentType': 'video/mp4'})
     
-    public_url = f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev/{key}"
-    return public_url
+    return f"{_r2_public_base()}/{key}"

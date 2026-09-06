@@ -1,0 +1,141 @@
+# video_providers.py
+# Ported from Lumen (youtube-automation-agent) utils/video-providers.js
+# Chain: Seedance (Replicate, real AI video clip) -> OpenAI image (real AI still,
+# Ken Burns motion applied at assembly) -> placeholder (flagged SIMULATED).
+import os
+import requests
+
+
+def _redact(msg: str) -> str:
+    import re
+    msg = re.sub(r'Bearer\s+[A-Za-z0-9._~-]+', 'Bearer [redacted]', str(msg))
+    msg = re.sub(r'(api[_-]?key|token|secret)=([^\s&]+)', r'\1=[redacted]', msg, flags=re.I)
+    return msg[:400]
+
+
+def provider_status() -> dict:
+    """Report which providers are configured (for /health and debugging)."""
+    return {
+        "seedance": bool(os.getenv("REPLICATE_API_TOKEN") or os.getenv("REPLICATE_API_KEY")),
+        "openai_image": bool(os.getenv("OPENAI_API_KEY")),
+        "placeholder": True,
+        "selected_order": os.getenv("VIDEO_PROVIDER_ORDER", "seedance,openai_image,placeholder"),
+    }
+
+
+# ---------- Seedance via Replicate (real video clip) ----------
+
+def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
+    token = os.getenv("REPLICATE_API_TOKEN") or os.getenv("REPLICATE_API_KEY")
+    if not token:
+        return False
+    try:
+        import replicate
+        client = replicate.Client(api_token=token)
+        model = os.getenv("SEEDANCE_MODEL", "bytedance/seedance-2.5")
+        clip_seconds = max(4, min(10, int(round(duration)) or 5))
+        prediction = client.predictions.create(
+            model=model,
+            input={
+                "prompt": prompt[:1900],
+                "duration": clip_seconds,
+                "resolution": os.getenv("VIDEO_RESOLUTION", "720p"),
+                "aspect_ratio": os.getenv("VIDEO_ASPECT_RATIO", "16:9"),
+                "output_format": "mp4",
+            },
+        )
+        prediction.wait()
+        if prediction.status != "succeeded":
+            print(f"[Video] Seedance failed: {_redact(prediction.error)}")
+            return False
+        out = prediction.output
+        url = None
+        if isinstance(out, str):
+            url = out
+        elif isinstance(out, list) and out:
+            url = str(out[0])
+        elif hasattr(out, "url"):
+            url = out.url() if callable(out.url) else out.url
+        if hasattr(out, "read"):
+            with open(output_path, "wb") as f:
+                f.write(out.read())
+            return True
+        if not url:
+            print("[Video] Seedance succeeded but returned no URL")
+            return False
+        r = requests.get(str(url), timeout=120)
+        if r.status_code != 200 or len(r.content) < 10000:
+            print(f"[Video] Seedance download failed: HTTP {r.status_code}")
+            return False
+        with open(output_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as e:
+        print(f"[Video] Seedance exception: {_redact(e)}")
+        return False
+
+
+# ---------- OpenAI image (real AI still; Ken Burns at assembly) ----------
+
+def _openai_image(prompt: str, output_path: str) -> bool:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        return False
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
+                "prompt": f"cinematic, ethereal, 16:9 video background frame: {prompt}"[:3900],
+                "size": "1536x1024",
+                "n": 1,
+            },
+            timeout=120,
+        )
+        if r.status_code != 200:
+            print(f"[Video] OpenAI image ERROR {r.status_code}: {_redact(r.text)}")
+            return False
+        data = r.json()["data"][0]
+        import base64
+        if data.get("b64_json"):
+            with open(output_path, "wb") as f:
+                f.write(base64.b64decode(data["b64_json"]))
+            return True
+        if data.get("url"):
+            img = requests.get(data["url"], timeout=60)
+            if img.status_code == 200:
+                with open(output_path, "wb") as f:
+                    f.write(img.content)
+                return True
+        return False
+    except Exception as e:
+        print(f"[Video] OpenAI image exception: {_redact(e)}")
+        return False
+
+
+# ---------- Public entry ----------
+
+def generate_scene_visual(prompt: str, out_base: str, duration: float):
+    """
+    Try providers in VIDEO_PROVIDER_ORDER.
+    Returns (file_path, provider_id, simulated_bool).
+    out_base has no extension; extension depends on provider (.mp4 clip or .png still).
+    """
+    prompt = (prompt or "Answers in Faith").strip()
+    order = [p.strip() for p in os.getenv(
+        "VIDEO_PROVIDER_ORDER", "seedance,openai_image,placeholder").split(",")]
+
+    for provider in order:
+        if provider == "seedance":
+            path = out_base + ".mp4"
+            if _seedance_clip(prompt, path, duration):
+                return path, "seedance", False
+        elif provider in ("openai_image", "image"):
+            path = out_base + ".png"
+            if _openai_image(prompt, path):
+                return path, "openai_image", False
+        elif provider == "placeholder":
+            break  # handled by caller (pipeline._generate_placeholder_visual)
+
+    return None, "placeholder", True
