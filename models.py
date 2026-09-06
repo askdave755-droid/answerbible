@@ -95,6 +95,7 @@ class Production(Base):
     approved_by = Column(String)
     approved_at = Column(DateTime)
     video_url = Column(String)
+    captions_url = Column(String)
     claims = relationship("Claim", back_populates="production", cascade="all, delete-orphan")
     scenes = relationship("Scene", back_populates="production", cascade="all, delete-orphan")
     reviews = relationship("ReviewDecision", back_populates="production", cascade="all, delete-orphan")
@@ -163,14 +164,15 @@ def get_engine(db_url=None):
 
 def init_db(engine):
     Base.metadata.create_all(bind=engine)
-    # Migration: add video_url column if missing
+    # Migration: add media URL columns if missing
     from sqlalchemy import inspect, text
     inspector = inspect(engine)
     if 'productions' in inspector.get_table_names():
         columns = [c['name'] for c in inspector.get_columns('productions')]
-        if 'video_url' not in columns:
-            with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE productions ADD COLUMN video_url VARCHAR"))
-                conn.commit()
+        for col in ('video_url', 'captions_url'):
+            if col not in columns:
+                with engine.connect() as conn:
+                    conn.execute(text(f"ALTER TABLE productions ADD COLUMN {col} VARCHAR"))
+                    conn.commit()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False)

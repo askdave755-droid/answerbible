@@ -6,9 +6,10 @@ import os
 
 from models import init_db, get_engine
 from pipeline import router as pipeline_router
+from video_providers import provider_status
 from config import settings
 
-app = FastAPI(title="Answers in Faith Engine", version="1.0.0")
+app = FastAPI(title="Answers in Faith Engine", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,7 +26,14 @@ app.include_router(pipeline_router, prefix="/api")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "Answers in Faith v1.0", "theological_gates": 12}
+    return {
+        "status": "ok",
+        "engine": "Answers in Faith v1.1",
+        "theological_gates": 12,
+        "video_providers": provider_status(),
+        "r2_configured": bool(os.getenv("R2_ACCOUNT_ID") and os.getenv("R2_BUCKET_NAME")),
+        "r2_public_url_set": bool(os.getenv("R2_PUBLIC_URL")),
+    }
 
 @app.get("/api/download/{prod_id}")
 def download_video(prod_id: str):
@@ -33,6 +41,13 @@ def download_video(prod_id: str):
     if os.path.exists(file_path):
         return FileResponse(file_path, media_type="video/mp4", filename=f"{prod_id}.mp4")
     return {"error": "Video not found. It may have been lost due to container restart."}
+
+@app.get("/api/download-captions/{prod_id}")
+def download_captions(prod_id: str):
+    file_path = f"./output/captions/{prod_id}.srt"
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="text/plain", filename=f"{prod_id}.srt")
+    return {"error": "Captions not found."}
 
 if __name__ == "__main__":
     import uvicorn
