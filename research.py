@@ -1,11 +1,17 @@
 # research.py — AI-assisted research drafting
-# Drafts the 6 research fields from topic + scripture via OpenAI.
+# Drafts the 6 research fields + theme suggestions via OpenAI.
 # David still reviews everything: this only PRE-FILLS, the 12-blocker gate is untouched.
 import json
 import requests
 from config import settings
 
 MODEL = "gpt-4o-mini"
+
+VALID_CATEGORIES = [
+    "general", "genesis_6", "sheol", "spiritual_warfare", "demons",
+    "election", "end_times", "divorce", "women_ministry", "salvation",
+    "character_of_god", "prophecy_dating",
+]
 
 PROMPT_TEMPLATE = """You are a research assistant for "Answers in Faith", a YouTube channel that answers
 Bible questions with theological rigor. The channel enforces 12 blockers:
@@ -23,16 +29,18 @@ Primary scripture: {primary_scripture}
 Category: {category}
 Gospel video: {gospel}
 
-Fill exactly these 6 fields, each 2-5 sentences, plain text, no markdown:
-1. hook — a gripping opening that raises the question honestly
-2. problem — why this confuses people / what's at stake
-3. explanation — what the text actually says, with context and original-language notes where relevant
-4. story — a relatable real-life illustration
-5. application — what the viewer should do with this
-6. cta — call to action inviting comments with the viewer's questions
+Fill exactly these 9 fields:
+1. hook — gripping opening that raises the question honestly (2-5 sentences, plain text)
+2. problem — why this confuses people / what's at stake (2-5 sentences)
+3. explanation — what the text actually says, with context and original-language notes where relevant; mention the main alternative interpretation where one exists (2-5 sentences)
+4. story — a relatable real-life illustration (2-5 sentences)
+5. application — what the viewer should do with this (2-5 sentences)
+6. cta — call to action inviting comments with the viewer's questions (1-2 sentences)
+7. suggested_title — a compelling but honest video title/theme (10 words max, no clickbait)
+8. suggested_scripture — the single best primary passage to anchor this video (e.g., "Genesis 6:1-4")
+9. suggested_category — EXACTLY one of: general, genesis_6, sheol, spiritual_warfare, demons, election, end_times, divorce, women_ministry, salvation, character_of_god, prophecy_dating
 
-Be balanced: mention the main alternative interpretation in the explanation where one exists.
-Return ONLY a JSON object: {{"hook": "...", "problem": "...", "explanation": "...", "story": "...", "application": "...", "cta": "..."}}"""
+Return ONLY a JSON object with keys: hook, problem, explanation, story, application, cta, suggested_title, suggested_scripture, suggested_category"""
 
 
 def auto_research(topic, source_question, primary_scripture, category, gospel_video):
@@ -63,4 +71,9 @@ def auto_research(topic, source_question, primary_scripture, category, gospel_vi
         raise RuntimeError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
     content = resp.json()["choices"][0]["message"]["content"]
     data = json.loads(content)
-    return {k: str(data.get(k, "")).strip() for k in ("hook", "problem", "explanation", "story", "application", "cta")}
+    keys = ("hook", "problem", "explanation", "story", "application", "cta",
+            "suggested_title", "suggested_scripture", "suggested_category")
+    out = {k: str(data.get(k, "")).strip() for k in keys}
+    if out["suggested_category"] not in VALID_CATEGORIES:
+        out["suggested_category"] = "general"
+    return out
