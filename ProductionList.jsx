@@ -23,6 +23,7 @@ export default function ProductionList() {
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [deleting, setDeleting] = useState('')
 
   useEffect(() => { load() }, [filter])
 
@@ -36,6 +37,19 @@ export default function ProductionList() {
       setError(e.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function handleDelete(p) {
+    if (!window.confirm(`Delete "${p.topic}" permanently? This cannot be undone.`)) return
+    setDeleting(p.id)
+    try {
+      await api.deleteProduction(p.id)
+      await load()
+    } catch (e) {
+      alert('Error: ' + e.message)
+    } finally {
+      setDeleting('')
     }
   }
 
@@ -79,6 +93,7 @@ export default function ProductionList() {
                   <th>Primary Scripture</th>
                   <th>Stage</th>
                   <th>Created</th>
+                  <th style={{width:60}}></th>
                 </tr>
               </thead>
               <tbody>
@@ -94,6 +109,17 @@ export default function ProductionList() {
                     <td><StageBadge stage={p.stage} /></td>
                     <td style={{color:'var(--text-muted)', fontSize:'0.8125rem'}}>
                       {new Date(p.created_at).toLocaleDateString()}
+                    </td>
+                    <td>
+                      <button
+                        className="btn btn-danger"
+                        style={{padding:'6px 10px', fontSize:'0.8125rem'}}
+                        onClick={() => handleDelete(p)}
+                        disabled={deleting === p.id}
+                        title="Delete production"
+                      >
+                        {deleting === p.id ? <div className="spinner" /> : '🗑'}
+                      </button>
                     </td>
                   </tr>
                 ))}
