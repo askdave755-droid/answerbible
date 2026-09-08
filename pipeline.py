@@ -356,7 +356,6 @@ def _produce_scenes(prod_id: str):
             visual_ok = scene.visual_path and os.path.exists(scene.visual_path)
             if scene.is_locked and audio_ok and visual_ok:
                 continue
-            # --- AUDIO (never drop a scene for missing audio) ---
             if not audio_ok:
                 audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
                 ok = False
@@ -370,7 +369,6 @@ def _produce_scenes(prod_id: str):
                     _silent_audio(audio_path, est)
                     print(f"[TTS] No voice generated for scene {scene.id}, using silent track")
                 scene.narration_audio_path = audio_path
-            # --- VISUAL: Lumen-style provider chain with simulated flagging ---
             if not visual_ok:
                 est_dur = max(3.0, min(float(settings.max_scene_duration),
                                        len(scene.narration_text or "") * 0.06))
@@ -732,6 +730,17 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "human_review_passed": prod.human_review_passed,
         "quality_gate_passed": prod.quality_gate_passed,
         "approved_by": prod.approved_by,
+        "requires_manual_review": prod.requires_manual_review,
+        "hook": prod.hook,
+        "problem": prod.problem,
+        "explanation": prod.explanation,
+        "story": prod.story,
+        "application": prod.application,
+        "cta": prod.cta,
+        "title": prod.title,
+        "description": prod.description,
+        "keywords": prod.keywords,
+        "thumbnail_prompt": prod.thumbnail_prompt,
         "has_video": has_video,
         "video_url": video_url,
         "captions_url": captions_url,
