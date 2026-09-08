@@ -1,5 +1,5 @@
 # research.py — AI-assisted research drafting
-# Drafts the 6 research fields + theme suggestions via OpenAI.
+# Drafts the 6 research fields + theme suggestions + claim/scene drafts via OpenAI.
 # David still reviews everything: this only PRE-FILLS, the 12-blocker gate is untouched.
 import json
 import requests
@@ -77,3 +77,82 @@ def auto_research(topic, source_question, primary_scripture, category, gospel_vi
     if out["suggested_category"] not in VALID_CATEGORIES:
         out["suggested_category"] = "general"
     return out
+
+
+SCRIPT_PROMPT_TEMPLATE = """You are a research assistant for "Answers in Faith", a YouTube channel with 12 theological blockers:
+- every claim needs scripture support and historical/literary context
+- no "this word only means" without lexical evidence
+- speculation must be labeled, never asserted as fact
+- no date-setting, no Antichrist identification
+- always present alternative interpretations honestly
+
+Draft ONE claim and ONE scene for a video, based on the research below.
+Quote the biblical text accurately from a standard translation (KJV or NIV). If unsure of exact wording, use KJV.
+
+Topic: {topic}
+Primary scripture: {primary_scripture}
+Hook: {hook}
+Problem: {problem}
+Explanation: {explanation}
+Story: {story}
+Application: {application}
+CTA: {cta}
+
+Return ONLY a JSON object with these keys:
+- claim_text: the single main theological claim (1-2 sentences)
+- source_reference: e.g. "Genesis 6:2"
+- source_text: the exact biblical verse text
+- original_language: e.g. "Hebrew" or "Greek" (the language of the source text), with the key original word and meaning if known
+- context: historical/literary/cultural context — MUST be 60+ characters
+- interpretation: your exegesis (1-3 sentences)
+- confidence: exactly one of: high, medium, low
+- claim_type: exactly one of: scripture, strong_inference, traditional, scholarly, speculation
+- cross_references: array of 1-4 related passages as strings
+- alternative_interpretations: the main alternative view, honestly stated (1-2 sentences)
+- narration_text: voiceover for scene 1, natural spoken style, 60-120 words, matching the hook + explanation
+- visual_prompt: image/video generation prompt for scene 1, cinematic, dark scholarly atmosphere, no text in image"""
+
+
+def auto_script(topic, primary_scripture, hook, problem, explanation, story, application, cta):
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured on the server.")
+    prompt = SCRIPT_PROMPT_TEMPLATE.format(
+        topic=topic or "(not specified)",
+        primary_scripture=primary_scripture or "(not specified)",
+        hook=hook or "(none)", problem=problem or "(none)", explanation=explanation or "(none)",
+        story=story or "(none)", application=application or "(none)", cta=cta or "(none)",
+    )
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        json={
+            "model": MODEL,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "You are a careful biblical research assistant. Output only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.6,
+        },
+        timeout=90,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI error {resp.status_code}: {resp.text[:200]}")
+    data = json.loads(resp.json()["choices"][0]["message"]["content"])
+    cross = data.get("cross_references", [])
+    if isinstance(cross, str):
+        cross = [c.strip() for c in cross.split(",") if c.strip()]
+    return {
+        "claim_text": str(data.get("claim_text", "")).strip(),
+        "source_reference": str(data.get("source_reference", "")).strip(),
+        "source_text": str(data.get("source_text", "")).strip(),
+        "original_language": str(data.get("original_language", "")).strip(),
+        "context": str(data.get("context", "")).strip(),
+        "interpretation": str(data.get("interpretation", "")).strip(),
+        "confidence": str(data.get("confidence", "medium")).strip().lower(),
+        "claim_type": str(data.get("claim_type", "scholarly")).strip().lower(),
+        "cross_references": [str(c) for c in cross][:4],
+        "alternative_interpretations": str(data.get("alternative_interpretations", "")).strip(),
+        "narration_text": str(data.get("narration_text", "")).strip(),
+        "visual_prompt": str(data.get("visual_prompt", "")).strip(),
+    }
