@@ -336,12 +336,21 @@ def human_review(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
     db.add(decision)
 
     if data.decision.lower() == "pass":
+        # DAVID APPROVES — human override of the automated gate.
+        # Mark all claims passed so production can proceed; keep an audit note.
+        claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
+        for claim in claims:
+            if claim.evidence_status != ReviewStatus.PASS:
+                old = (claim.evidence_notes or "")[:200]
+                claim.evidence_status = ReviewStatus.PASS
+                claim.evidence_notes = f"OVERRIDDEN by human review ({data.reviewer})" + (f" — gate had flagged: {old}" if old else "")
+        prod.evidence_gate_passed = True
         prod.stage = Stage.HUMAN_REVIEW
         prod.approved_by = data.reviewer
         prod.approved_at = datetime.utcnow()
         prod.human_review_passed = True
         db.commit()
-        return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for production."}
+        return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED (human override). Ready for production."}
     else:
         db.commit()
         return {"id": prod.id, "stage": "evidence_gate", "message": f"Review: {data.decision.upper()}. Repair required."}
