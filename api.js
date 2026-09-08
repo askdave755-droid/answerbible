@@ -1,5 +1,7 @@
 const API_URL = 'https://answerbible-production.up.railway.app/api'
 
+export const API_BASE = API_URL
+
 async function request(path, options = {}) {
   const url = `${API_URL}${path}`
   const res = await fetch(url, {
@@ -18,6 +20,8 @@ export const api = {
   listProductions: (stage) => request(`/productions${stage ? `?stage=${stage}` : ''}`),
   getProduction: (id) => request(`/productions/${id}`),
   createProduction: (data) => request('/productions', { method: 'POST', body: JSON.stringify(data) }),
+  deleteProduction: (id) => request(`/productions/${id}`, { method: 'DELETE' }),
+  autoResearch: (id) => request(`/productions/${id}/auto-research`, { method: 'POST' }),
   submitResearch: (id, data) => request(`/productions/${id}/research`, { method: 'POST', body: JSON.stringify(data) }),
   submitScript: (id, data) => request(`/productions/${id}/script`, { method: 'POST', body: JSON.stringify(data) }),
   runEvidenceGate: (id) => request(`/productions/${id}/evidence`, { method: 'POST' }),
