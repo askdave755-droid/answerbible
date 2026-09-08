@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api.js'
+import ResearchLinks from './ResearchLinks.jsx'
 
 const CATEGORIES = [
   { value: 'general', label: 'General' },
@@ -66,6 +67,8 @@ export default function NewProduction() {
             {loading ? <div className="spinner" /> : 'Create Production'}
           </button>
         </form>
+
+        <ResearchLinks scripture={form.primary_scripture} topic={form.topic} />
       </div>
     </div>
   )
