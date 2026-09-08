@@ -812,3 +812,25 @@ def delete_production(prod_id: str, db: Session = Depends(get_db)):
     db.delete(prod)
     db.commit()
     return {"id": prod_id, "message": "Deleted"}
+
+# ============ STARTUP RECOVERY ============
+def _recover_stuck_on_boot():
+    """Redeploys kill in-flight background tasks — reset stuck productions on boot."""
+    try:
+        engine = get_engine(settings.database_url)
+        db = SessionLocal(bind=engine)
+        stuck = db.query(Production).filter(Production.stage.in_([Stage.PRODUCTION, Stage.ASSEMBLY])).all()
+        for prod in stuck:
+            prod.stage = Stage.HUMAN_REVIEW
+            db.add(ReviewDecision(
+                id=str(uuid.uuid4()), production_id=prod.id, stage="recovery",
+                decision=ReviewStatus.FAIL, reviewer="system",
+                notes="Reset on server restart — background task was interrupted. Re-run Start Production."))
+        if stuck:
+            db.commit()
+            print(f"[Recovery] Reset {len(stuck)} stuck production(s) to HUMAN_REVIEW")
+        db.close()
+    except Exception as e:
+        print(f"[Recovery] Startup recovery error: {e}")
+
+_recover_stuck_on_boot()
