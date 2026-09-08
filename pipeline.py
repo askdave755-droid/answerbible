@@ -52,7 +52,7 @@ from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus
 from config import settings
 from theology_gate import run_theology_gate
 from video_providers import generate_scene_visual, provider_status
-from research import auto_research
+from research import auto_research, auto_script
 
 router = APIRouter()
 
@@ -185,6 +185,28 @@ def auto_research_endpoint(prod_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "draft": draft,
             "message": "AI research draft saved. Review it on the Overview tab, then submit script + claims."}
+
+@router.post("/productions/{prod_id}/auto-script")
+def auto_script_endpoint(prod_id: str, db: Session = Depends(get_db)):
+    """AI drafts ONE claim + ONE scene from the approved research.
+    Draft is returned for review only — nothing is saved until you submit."""
+    prod = db.query(Production).filter(Production.id == prod_id).first()
+    if not prod:
+        raise HTTPException(404, "Production not found")
+    if prod.stage != Stage.RESEARCH:
+        raise HTTPException(400, f"Auto-script only works at RESEARCH stage, got {prod.stage.value}")
+    try:
+        draft = auto_script(
+            prod.topic, prod.primary_scripture,
+            prod.hook, prod.problem, prod.explanation,
+            prod.story, prod.application, prod.cta
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Script drafting failed: {e}")
+    return {"id": prod.id, "draft": draft,
+            "message": "Claims & scene drafted. Review every field, edit, then submit."}
 
 @router.post("/productions/{prod_id}/script")
 def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db)):
