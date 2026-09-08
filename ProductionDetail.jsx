@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { api } from '../api.js'
+import { api, API_BASE } from '../api.js'
 import StageBadge from './StageBadge.jsx'
 import StageProgress from './StageProgress.jsx'
 import ClaimReview from './ClaimReview.jsx'
 import SceneManager from './SceneManager.jsx'
+import ResearchLinks from './ResearchLinks.jsx'
 
 const TABS = ['overview', 'claims', 'scenes', 'actions']
 
@@ -48,6 +49,18 @@ export default function ProductionDetail() {
     }
   }
 
+  async function handleDelete() {
+    if (!window.confirm(`Delete "${prod.topic}" permanently? This cannot be undone.`)) return
+    setActionLoading(true)
+    try {
+      await api.deleteProduction(id)
+      navigate('/')
+    } catch (e) {
+      alert('Error: ' + e.message)
+      setActionLoading(false)
+    }
+  }
+
   if (loading) return <div className="container empty-state"><div className="spinner" /> Loading...</div>
   if (error) return <div className="container empty-state" style={{color:'var(--danger)'}}>Error: {error}</div>
   if (!prod) return null
@@ -58,6 +71,14 @@ export default function ProductionDetail() {
   const canQuality = prod.stage === 'quality_gate'
   const canPackage = prod.stage === 'packaging'
   const canApprove = prod.stage === 'approval'
+
+  // R2 public URL if uploaded, otherwise stream from the Railway container
+  const videoSrc = prod.video_url
+    ? prod.video_url
+    : (prod.has_video ? `${API_BASE}/download/${id}` : null)
+  const captionsSrc = prod.captions_url
+    ? prod.captions_url
+    : (prod.has_video ? `${API_BASE}/download-captions/${id}` : null)
 
   return (
     <div className="container">
@@ -73,7 +94,12 @@ export default function ProductionDetail() {
               {prod.gospel_video && <span style={{marginLeft:12, color:'var(--accent)'}}>⛪ Gospel Video</span>}
             </div>
           </div>
-          <StageBadge stage={prod.stage} />
+          <div style={{display:'flex', gap:8, alignItems:'center'}}>
+            <StageBadge stage={prod.stage} />
+            <button className="btn btn-danger" onClick={handleDelete} disabled={actionLoading} title="Delete production">
+              🗑 Delete
+            </button>
+          </div>
         </div>
 
         <StageProgress currentStage={prod.stage} />
@@ -84,6 +110,22 @@ export default function ProductionDetail() {
           <div className="badge" style={{background:'var(--surface-2)'}}>Quality: {prod.quality_gate_passed ? '✓' : '—'}</div>
           {prod.approved_by && <div className="badge" style={{background:'var(--surface-2)'}}>Approved by {prod.approved_by}</div>}
         </div>
+
+        {videoSrc && (
+          <div style={{marginTop:16}}>
+            <video controls preload="metadata" src={videoSrc} style={{width:'100%', borderRadius:8, background:'#000', maxHeight:420}} />
+            <div style={{display:'flex', gap:8, marginTop:12, flexWrap:'wrap'}}>
+              <a className="btn btn-primary" href={videoSrc} download={`${prod.topic?.replace(/[^a-z0-9]+/gi,'_') || id}.mp4`}>
+                ⬇ Download Video
+              </a>
+              {captionsSrc && (
+                <a className="btn btn-outline" href={captionsSrc} download={`${id}.srt`}>
+                  ⬇ Download Captions (.srt)
+                </a>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="tabs">
@@ -98,6 +140,19 @@ export default function ProductionDetail() {
       {tab === 'overview' && (
         <div className="card">
           <div className="card-title">Overview</div>
+          <ResearchLinks scripture={prod.primary_scripture} topic={prod.topic} />
+          {prod.stage === 'discovery' && (
+            <div style={{marginTop:12, padding:'12px 16px', border:'1px dashed var(--accent)', borderRadius:8}}>
+              <div style={{fontWeight:600, marginBottom:4}}>⚡ Auto-Research</div>
+              <div style={{color:'var(--text-muted)', fontSize:'0.8125rem', marginBottom:10}}>
+                Let AI draft the hook, problem, explanation, story, application & CTA from your topic + scripture.
+                You review the draft before anything advances.
+              </div>
+              <button className="btn btn-primary" onClick={() => doAction(api.autoResearch, id)} disabled={actionLoading}>
+                {actionLoading ? <div className="spinner" /> : '⚡ Draft Research with AI'}
+              </button>
+            </div>
+          )}
           {prod.hook && <div style={{marginBottom:12}}><strong>Hook:</strong> {prod.hook}</div>}
           {prod.problem && <div style={{marginBottom:12}}><strong>Problem:</strong> {prod.problem}</div>}
           {prod.explanation && <div style={{marginBottom:12}}><strong>Explanation:</strong> {prod.explanation}</div>}
