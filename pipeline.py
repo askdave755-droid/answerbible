@@ -28,9 +28,6 @@ def get_r2_client():
     )
 
 def _r2_public_base() -> str:
-    # Set R2_PUBLIC_URL to the bucket's real pub-<hash>.r2.dev URL (or custom domain).
-    # The pub-{account_id} fallback is NOT a valid R2 URL — kept only to avoid crashing.
-    # rstrip('/') guards against a trailing slash in R2_PUBLIC_URL producing //videos/...
     return os.getenv('R2_PUBLIC_URL', f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev").rstrip('/')
 
 def upload_video(prod_id: str, file_path: str) -> str:
@@ -55,6 +52,7 @@ from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus
 from config import settings
 from theology_gate import run_theology_gate
 from video_providers import generate_scene_visual, provider_status
+from research import auto_research
 
 router = APIRouter()
 
@@ -158,6 +156,35 @@ def submit_research(prod_id: str, data: ResearchSubmit, db: Session = Depends(ge
     prod.stage = Stage.RESEARCH
     db.commit()
     return {"id": prod.id, "stage": prod.stage.value, "message": "Research submitted. Submit script + claims."}
+
+@router.post("/productions/{prod_id}/auto-research")
+def auto_research_endpoint(prod_id: str, db: Session = Depends(get_db)):
+    """AI drafts the 6 research fields. Only available at DISCOVERY stage.
+    David reviews the draft on the Overview tab — gates are untouched."""
+    prod = db.query(Production).filter(Production.id == prod_id).first()
+    if not prod:
+        raise HTTPException(404, "Production not found")
+    if prod.stage != Stage.DISCOVERY:
+        raise HTTPException(400, f"Auto-research only works at DISCOVERY stage, got {prod.stage.value}")
+    try:
+        draft = auto_research(
+            prod.topic, prod.source_question, prod.primary_scripture,
+            prod.doctrinal_category.value, prod.gospel_video
+        )
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Research generation failed: {e}")
+    prod.hook = draft["hook"]
+    prod.problem = draft["problem"]
+    prod.explanation = draft["explanation"]
+    prod.story = draft["story"]
+    prod.application = draft["application"]
+    prod.cta = draft["cta"]
+    prod.stage = Stage.RESEARCH
+    db.commit()
+    return {"id": prod.id, "stage": prod.stage.value, "draft": draft,
+            "message": "AI research draft saved. Review it on the Overview tab, then submit script + claims."}
 
 @router.post("/productions/{prod_id}/script")
 def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db)):
@@ -310,7 +337,7 @@ def produce(prod_id: str, background_tasks: BackgroundTasks, db: Session = Depen
         raise HTTPException(400, f"{failed} claims have not passed evidence gate")
 
     prod.stage = Stage.PRODUCTION
-    prod.status = "active"  # clear any previous simulated flag on retry
+    prod.status = "active"
     db.commit()
     background_tasks.add_task(_produce_scenes, prod_id)
     return {"id": prod.id, "stage": prod.stage.value,
@@ -512,7 +539,6 @@ def _assemble_video(prod_id: str, db: Session):
            "-i", concat_file, "-c", "copy", final_output]
     result = subprocess.run(cmd, capture_output=True, timeout=120)
     if result.returncode != 0 or not os.path.exists(final_output):
-        # Re-encode fallback in case stream-copy rejects mismatched params
         cmd = [settings.ffmpeg_path, "-y", "-f", "concat", "-safe", "0",
                "-i", concat_file, "-c:v", "libx264", "-pix_fmt", "yuv420p",
                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", final_output]
@@ -529,7 +555,6 @@ def _assemble_video(prod_id: str, db: Session):
     except Exception as e:
         print(f"[R2] Upload failed (local file kept): {e}")
 
-    # --- Captions (SRT), Lumen-style ---
     try:
         srt_path = _write_captions(prod_id, scenes)
         if srt_path:
@@ -541,7 +566,6 @@ def _assemble_video(prod_id: str, db: Session):
     except Exception as e:
         print(f"[Captions] Failed: {e}")
 
-    # --- Simulated honesty gate (ported from Lumen) ---
     simulated = any(s.generation_status == "simulated" for s in scenes)
     if simulated:
         prod.status = "simulated"
@@ -627,7 +651,6 @@ def quality_gate(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
     if prod.stage != Stage.QUALITY_GATE:
         raise HTTPException(400, f"Expected QUALITY_GATE, got {prod.stage.value}")
 
-    # Lumen-style honesty: placeholder visuals can never pass quality
     if data.decision.lower() == "pass" and prod.status == "simulated":
         db.add(ReviewDecision(
             id=str(uuid.uuid4()), production_id=prod_id, stage="quality_gate",
