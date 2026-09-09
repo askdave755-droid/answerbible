@@ -3,6 +3,7 @@
 # Chain: Seedance (Replicate, real AI video clip) -> OpenAI image (real AI still,
 # Ken Burns motion applied at assembly) -> placeholder (flagged SIMULATED).
 import os
+import time
 import requests
 
 
@@ -44,9 +45,16 @@ def _seedance_clip(prompt: str, output_path: str, duration: float) -> bool:
                 "output_format": "mp4",
             },
         )
-        prediction.wait()
+        # Bounded wait: poll up to ~10 minutes, then give up (fallback to next provider).
+        # prediction.wait() alone can hang forever when Replicate queues the job.
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            prediction.reload()
+            if prediction.status in ("succeeded", "failed", "canceled"):
+                break
+            time.sleep(5)
         if prediction.status != "succeeded":
-            print(f"[Video] Seedance failed: {_redact(prediction.error)}")
+            print(f"[Video] Seedance did not succeed (status={prediction.status}): {_redact(getattr(prediction, 'error', ''))}")
             return False
         out = prediction.output
         url = None
