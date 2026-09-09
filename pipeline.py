@@ -52,7 +52,7 @@ from models import Production, Claim, Scene, ReviewDecision, Stage, ReviewStatus
 from config import settings
 from theology_gate import run_theology_gate
 from video_providers import generate_scene_visual, provider_status
-from research import auto_research, auto_script
+from research import auto_research
 
 router = APIRouter()
 
@@ -186,28 +186,6 @@ def auto_research_endpoint(prod_id: str, db: Session = Depends(get_db)):
     return {"id": prod.id, "stage": prod.stage.value, "draft": draft,
             "message": "AI research draft saved. Review it on the Overview tab, then submit script + claims."}
 
-@router.post("/productions/{prod_id}/auto-script")
-def auto_script_endpoint(prod_id: str, db: Session = Depends(get_db)):
-    """AI drafts ONE claim + ONE scene from the approved research.
-    Draft is returned for review only — nothing is saved until you submit."""
-    prod = db.query(Production).filter(Production.id == prod_id).first()
-    if not prod:
-        raise HTTPException(404, "Production not found")
-    if prod.stage != Stage.RESEARCH:
-        raise HTTPException(400, f"Auto-script only works at RESEARCH stage, got {prod.stage.value}")
-    try:
-        draft = auto_script(
-            prod.topic, prod.primary_scripture,
-            prod.hook, prod.problem, prod.explanation,
-            prod.story, prod.application, prod.cta
-        )
-    except RuntimeError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"Script drafting failed: {e}")
-    return {"id": prod.id, "draft": draft,
-            "message": "Claims & scene drafted. Review every field, edit, then submit."}
-
 @router.post("/productions/{prod_id}/script")
 def submit_script(prod_id: str, data: ScriptSubmit, db: Session = Depends(get_db)):
     prod = db.query(Production).filter(Production.id == prod_id).first()
@@ -336,21 +314,12 @@ def human_review(prod_id: str, data: ReviewSubmit, db: Session = Depends(get_db)
     db.add(decision)
 
     if data.decision.lower() == "pass":
-        # DAVID APPROVES — human override of the automated gate.
-        # Mark all claims passed so production can proceed; keep an audit note.
-        claims = db.query(Claim).filter(Claim.production_id == prod_id).all()
-        for claim in claims:
-            if claim.evidence_status != ReviewStatus.PASS:
-                old = (claim.evidence_notes or "")[:200]
-                claim.evidence_status = ReviewStatus.PASS
-                claim.evidence_notes = f"OVERRIDDEN by human review ({data.reviewer})" + (f" — gate had flagged: {old}" if old else "")
-        prod.evidence_gate_passed = True
         prod.stage = Stage.HUMAN_REVIEW
         prod.approved_by = data.reviewer
         prod.approved_at = datetime.utcnow()
         prod.human_review_passed = True
         db.commit()
-        return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED (human override). Ready for production."}
+        return {"id": prod.id, "stage": prod.stage.value, "message": "APPROVED. Ready for production."}
     else:
         db.commit()
         return {"id": prod.id, "stage": "evidence_gate", "message": f"Review: {data.decision.upper()}. Repair required."}
@@ -387,6 +356,7 @@ def _produce_scenes(prod_id: str):
             visual_ok = scene.visual_path and os.path.exists(scene.visual_path)
             if scene.is_locked and audio_ok and visual_ok:
                 continue
+            # --- AUDIO (never drop a scene for missing audio) ---
             if not audio_ok:
                 audio_path = f"{settings.output_dir}/audio/{scene.id}.mp3"
                 ok = False
@@ -400,6 +370,7 @@ def _produce_scenes(prod_id: str):
                     _silent_audio(audio_path, est)
                     print(f"[TTS] No voice generated for scene {scene.id}, using silent track")
                 scene.narration_audio_path = audio_path
+            # --- VISUAL: Lumen-style provider chain with simulated flagging ---
             if not visual_ok:
                 est_dur = max(3.0, min(float(settings.max_scene_duration),
                                        len(scene.narration_text or "") * 0.06))
@@ -761,17 +732,6 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
         "human_review_passed": prod.human_review_passed,
         "quality_gate_passed": prod.quality_gate_passed,
         "approved_by": prod.approved_by,
-        "requires_manual_review": prod.requires_manual_review,
-        "hook": prod.hook,
-        "problem": prod.problem,
-        "explanation": prod.explanation,
-        "story": prod.story,
-        "application": prod.application,
-        "cta": prod.cta,
-        "title": prod.title,
-        "description": prod.description,
-        "keywords": prod.keywords,
-        "thumbnail_prompt": prod.thumbnail_prompt,
         "has_video": has_video,
         "video_url": video_url,
         "captions_url": captions_url,
@@ -812,25 +772,3 @@ def delete_production(prod_id: str, db: Session = Depends(get_db)):
     db.delete(prod)
     db.commit()
     return {"id": prod_id, "message": "Deleted"}
-
-# ============ STARTUP RECOVERY ============
-def _recover_stuck_on_boot():
-    """Redeploys kill in-flight background tasks — reset stuck productions on boot."""
-    try:
-        engine = get_engine(settings.database_url)
-        db = SessionLocal(bind=engine)
-        stuck = db.query(Production).filter(Production.stage.in_([Stage.PRODUCTION, Stage.ASSEMBLY])).all()
-        for prod in stuck:
-            prod.stage = Stage.HUMAN_REVIEW
-            db.add(ReviewDecision(
-                id=str(uuid.uuid4()), production_id=prod.id, stage="recovery",
-                decision=ReviewStatus.FAIL, reviewer="system",
-                notes="Reset on server restart — background task was interrupted. Re-run Start Production."))
-        if stuck:
-            db.commit()
-            print(f"[Recovery] Reset {len(stuck)} stuck production(s) to HUMAN_REVIEW")
-        db.close()
-    except Exception as e:
-        print(f"[Recovery] Startup recovery error: {e}")
-
-_recover_stuck_on_boot()
