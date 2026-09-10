@@ -531,11 +531,14 @@ def _assemble_video(prod_id: str, db: Session):
         return
 
     scene_list = []
+    last_clip_error = ""
     for scene in scenes:
         if not scene.narration_audio_path or not os.path.exists(scene.narration_audio_path):
+            last_clip_error = f"missing audio file: {scene.narration_audio_path}"
             print(f"[Assembly] Missing audio for scene {scene.id}")
             continue
         if not scene.visual_path or not os.path.exists(scene.visual_path):
+            last_clip_error = f"missing visual file: {scene.visual_path}"
             print(f"[Assembly] Missing visual for scene {scene.id}")
             continue
         dur = _get_audio_duration(scene.narration_audio_path)
@@ -551,12 +554,14 @@ def _assemble_video(prod_id: str, db: Session):
             if result.returncode == 0 and os.path.exists(clip):
                 scene_list.append(clip)
             else:
-                print(f"[Assembly] Scene clip failed: {result.stderr.decode()[:200]}")
+                last_clip_error = result.stderr.decode()[:300]
+                print(f"[Assembly] Scene clip failed: {last_clip_error[:200]}")
         except Exception as e:
+            last_clip_error = f"{type(e).__name__}: {e}"
             print(f"[Assembly] Scene exception: {e}")
 
     if not scene_list:
-        _fail_production(db, prod_id, "All scene clips failed to render")
+        _fail_production(db, prod_id, f"All scene clips failed to render. Last error: {last_clip_error[:350]}")
         return
 
     concat_file = f"{settings.output_dir}/final/{prod_id}_concat.txt"
@@ -789,6 +794,14 @@ def get_production(prod_id: str, db: Session = Depends(get_db)):
                     "narration_text": s.narration_text, "visual_prompt": s.visual_prompt} for s in scenes]
     }
 
+@router.get("/productions/{prod_id}/decisions")
+def list_decisions(prod_id: str, db: Session = Depends(get_db)):
+    """Read the audit trail — including system failure notes from production/assembly."""
+    ds = db.query(ReviewDecision).filter(ReviewDecision.production_id == prod_id).order_by(ReviewDecision.created_at).all()
+    return [{"stage": d.stage, "decision": d.decision.value, "reviewer": d.reviewer,
+             "notes": d.notes,
+             "created_at": d.created_at.isoformat() if d.created_at else None} for d in ds]
+
 @router.get("/productions")
 def list_productions(stage: Optional[str] = None, db: Session = Depends(get_db)):
     q = db.query(Production)
@@ -812,3 +825,25 @@ def delete_production(prod_id: str, db: Session = Depends(get_db)):
     db.delete(prod)
     db.commit()
     return {"id": prod_id, "message": "Deleted"}
+
+# ============ STARTUP RECOVERY ============
+def _recover_stuck_on_boot():
+    """Redeploys kill in-flight background tasks — reset stuck productions on boot."""
+    try:
+        engine = get_engine(settings.database_url)
+        db = SessionLocal(bind=engine)
+        stuck = db.query(Production).filter(Production.stage.in_([Stage.PRODUCTION, Stage.ASSEMBLY])).all()
+        for prod in stuck:
+            prod.stage = Stage.HUMAN_REVIEW
+            db.add(ReviewDecision(
+                id=str(uuid.uuid4()), production_id=prod.id, stage="recovery",
+                decision=ReviewStatus.FAIL, reviewer="system",
+                notes="Reset on server restart — background task was interrupted. Re-run Start Production."))
+        if stuck:
+            db.commit()
+            print(f"[Recovery] Reset {len(stuck)} stuck production(s) to HUMAN_REVIEW")
+        db.close()
+    except Exception as e:
+        print(f"[Recovery] Startup recovery error: {e}")
+
+_recover_stuck_on_boot()
